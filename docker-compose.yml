@@ -1,0 +1,25 @@
+# 用法：
+#   cp .env.example .env   # 先准备配置文件（必须存在）
+#   docker compose up --build
+services:
+  proxyscrape:
+    build: .
+    image: proxyscrape-register:latest
+    env_file:
+      - .env
+    environment:
+      # 容器内必须监听 0.0.0.0 才能被宿主机访问
+      WEB_HOST: "0.0.0.0"
+      WEB_PORT: "${WEB_PORT:-5080}"
+      # Turnstile Solver 通常跑在宿主机（需要浏览器），容器经 host.docker.internal 访问
+      TURNSTILE_SOLVER_URL: "${TURNSTILE_SOLVER_URL:-http://host.docker.internal:5072}"
+    ports:
+      - "${WEB_PORT:-5080}:${WEB_PORT:-5080}"
+    volumes:
+      # 产物持久化 + 配置页写回 .env 后宿主机可见
+      - ./keys:/app/keys
+      - ./.env:/app/.env
+    extra_hosts:
+      # 让容器内能用 host.docker.internal 指向宿主机（Linux 需要 host-gateway）
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
