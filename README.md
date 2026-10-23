@@ -59,8 +59,8 @@ ProxyScrape 账号批量注册与 Premium 试用代理自动获取工具。
 
 ## 环境要求
 
-- Python 3.10+（推荐 3.11）
-- 一个可用的 **Turnstile Solver**（仓库自带 `api_solver.py`，依赖浏览器内核）
+- **只用 Docker**：宿主机只需 Docker + Compose。镜像已内置 Python 运行时、Turnstile Solver 与浏览器，直接看 [Docker](#docker) 一节，一条命令即可运行。
+- **本机直接运行**：需要 Python 3.10+（推荐 3.11）与可用的 **Turnstile Solver**（仓库自带 `api_solver.py`，依赖浏览器内核）。
 - 可访问 `https://api.tempmail.ing`
 
 ## 快速开始
@@ -93,6 +93,8 @@ REGISTER_PASSWORD=               # 留空表示每个账号随机生成
 ```
 
 ### 3. 启动 Turnstile Solver
+
+> Docker 部署无需本步骤：镜像内置了 solver 与浏览器，见 [Docker](#docker)。
 
 另开一个终端并保持运行：
 
@@ -259,32 +261,51 @@ python download_proxies.py --all --from-file keys/proxyscrape_accounts.txt
 
 ## Docker
 
-镜像包含 `main.py`、`web_app.py` 与 `download_proxies.py`。Turnstile Solver 依赖浏览器，建议运行在宿主机，容器通过 `host.docker.internal` 访问。
-
-### 本地构建
+镜像内置 Turnstile Solver 与 camoufox 浏览器：宿主机只需要 Docker，不需要安装 Python、浏览器或 solver。
 
 ```bash
-cp .env.example .env            # compose 必须读取该文件
-docker compose up --build -d    # 启动 Web 管理台
+cp .env.example .env        # 首次部署必须创建，compose 会读取
+docker compose up -d --build
 ```
 
-仅运行 CLI：
+启动后：
+
+| 服务 | 作用 | 端口 |
+|------|------|------|
+| `proxyscrape` | Web 管理台 + 批量注册 | `${WEB_PORT:-5080}` |
+| `solver` | Turnstile 求解（内置浏览器） | 仅容器内网 `5072` |
+
+管理台默认地址 `http://127.0.0.1:5080`，密码见 `.env` 的 `WEB_PASSWORD`。
+
+镜像约 5.3 GB，其中 camoufox 自带的 Firefox 约 2.4 GB。浏览器在构建阶段下载并固化进镜像，运行期不再联网拉取；首次构建需下载约 500 MB 资源，耗时数分钟。宿主机建议预留 10 GB 磁盘。
+
+### 常用操作
 
 ```bash
-docker compose run --rm proxyscrape python main.py
+docker compose ps                                              # 两个服务状态（solver 带健康检查）
+docker compose logs -f solver                                  # 求解日志
+docker compose exec --user appuser proxyscrape python main.py  # 手工跑一次 CLI 注册
+docker compose run --rm --user appuser proxyscrape python main.py
+docker compose down                                            # 停止
 ```
 
-不使用 compose：
+容器主进程以 `appuser(10001)` 运行；`docker compose exec/run` 默认以 root 进入容器，执行会写 `keys/` 的命令时请加 `--user appuser`，避免宿主机上出现 root 属主的产物文件。
+
+不使用 compose 时，需要自行提供 solver（可与应用共用同一镜像的两个容器）：
 
 ```bash
 docker build -t proxy_reg .
-docker run -d --name proxy_reg \
+docker network create proxyreg
+
+docker run -d --name solver --network proxyreg --shm-size=1g \
+  proxy_reg python api_solver.py --browser_type camoufox --thread 1 --host 0.0.0.0 --port 5072
+
+docker run -d --name proxy_reg --network proxyreg \
   -p 5080:5080 --env-file .env \
-  -e WEB_HOST=0.0.0.0 \
+  -e WEB_HOST=0.0.0.0 -e TURNSTILE_SOLVER_URL=http://solver:5072 \
   -v "$PWD/keys:/app/keys" -v "$PWD/.env:/app/.env" \
   --add-host host.docker.internal:host-gateway \
-  --restart unless-stopped \
-  proxy_reg
+  --restart unless-stopped proxy_reg
 ```
 
 ### 使用 CI 构建的镜像
@@ -311,11 +332,44 @@ IMAGE=ghcr.io/zixiwu/proxy_reg:1.0.0 docker compose up -d   # 回滚到指定版
 
 ### 部署说明
 
-- 镜像基于 `python:3.11-slim`，以 uid 10001 的非 root 用户运行，并内置 `/api/health` 健康检查。
+- 镜像基于 `python:3.11-slim`，内置 camoufox 浏览器与 Turnstile Solver，`docker compose up -d --build` 后两个服务自动就绪。
+- 应用与 solver 均以非 root 的 `appuser(10001)` 运行；solver 需要 `/dev/shm`，compose 中已设置 `shm_size: 1gb`，单容器运行时请加 `--shm-size=1g`。
 - `keys/` 与 `.env` 通过 bind mount 持久化；Web 配置页的修改会写回宿主机 `.env`。
-- Linux 宿主机上 bind mount 的属主为宿主机用户，可直接 `sudo chown -R 10001:10001 keys`，或在 service 中指定 `user: "${UID:-1000}:${GID:-1000}"`。
+- 容器入口脚本以 root 启动，先把 `/app/keys` 与 `/app/.env` 修正为 `appuser(10001)` 所有，再降权执行应用，宿主机无需预先 chown。若在 compose 中显式指定 `user:`，则跳过该修正，需保证宿主机目录对该用户可写。
 - 镜像目前仅构建 `linux/amd64`。在 ARM 设备上可使用 `--platform linux/amd64`（经 QEMU 模拟，性能有损耗），或打开 workflow 中 `platforms` 注释项重建多架构镜像。
 - `PROXY` 指向宿主机服务时，同样需要使用 `host.docker.internal`。
+
+### 部署排错（实测记录）
+
+下面几条来自真实的 Docker 部署验证，按「现象 → 原因 → 处理」列出。
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| 日志反复出现 `Failed to establish a new connection ... 5072`，随后 `CAPTCHA 失败，换号` | solver 服务没起来，或 `TURNSTILE_SOLVER_URL` 指向了不可达地址 | `docker compose ps` 看 `solver` 是否 healthy；必要时 `docker compose logs solver`。容器内自检：`docker compose exec proxyscrape python -c "import socket;socket.create_connection(('solver',5072),3);print('ok')"` |
+| `[Errno 13] Permission denied: 'keys/proxies.txt'` | 容器以 uid 10001 运行，而 `./keys` 由 Docker 以 root 创建 | 入口脚本启动时会自动修正属主；已有容器可 `sudo chown -R 10001:10001 keys && docker compose restart` |
+| Web 配置页保存后，注册日志改连 `127.0.0.1:5072` | 保存配置会把空白项写入 `.env`，旧实现 `load_dotenv(override=True)` 用空值覆盖了容器注入的变量 | 已改为「空值不覆盖非空环境变量」，`.env` 留空时 compose 注入的 `http://solver:5072` 不会被覆盖 |
+| `keys/` 下的文件属主变成 `root` | `docker compose exec` / `run` 默认以 root 进入容器 | 追加 `--user appuser`；或直接使用 Web 管理台触发注册（主进程固定为 10001） |
+| `docker compose up` 报 `env file ... not found` | compose 的 `env_file` 指向 `.env`，首次部署尚未创建 | 先执行 `cp .env.example .env` |
+| 注册成功后 `/api/accounts` 仍为空 | 账号文件在容器内写入，宿主机看的是 `./keys` | 确认 bind mount 生效：`docker compose exec proxyscrape ls -l keys` |
+
+只有把 solver 移出 compose（例如宿主机已有独立浏览器环境）时，才需要下面的 systemd 常驻：
+
+```ini
+[Unit]
+Description=Turnstile Solver
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/proxy_reg
+ExecStart=/opt/proxy_reg/.venv/bin/python api_solver.py --browser_type camoufox --thread 1 --host 0.0.0.0 --port 5072
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`systemctl enable --now turnstile-solver` 后，主机重启也能自动拉起；日志用 `journalctl -u turnstile-solver -f` 查看。
 
 ### 持续集成
 
@@ -424,7 +478,7 @@ docker build -t proxy_reg:test .
 临时邮箱免费接口有频率限制，`MAIL_GENERATE_INTERVAL` 默认 15 秒，批量注册时每个账号都会等待该间隔。
 
 **Solver 连接失败**
-`TURNSTILE_SOLVER_URL` 默认为 `http://127.0.0.1:5072`；容器内需使用 `http://host.docker.internal:5072`（compose 已默认设置）。分机部署时检查防火墙。
+compose 默认把 `TURNSTILE_SOLVER_URL` 指向内置的 `solver` 服务（`http://solver:5072`）。若改为外部 solver，需保证容器网络可达；本机直接运行 `python main.py` 时默认 `http://127.0.0.1:5072`。
 
 **拉取镜像返回 401 或 manifest unknown**
 镜像为公开包，正常情况下可直接拉取；401 通常表示包已改为私有，需要 `docker login ghcr.io`。`latest` 与分支标签仅在默认分支构建时产出，PR 构建不推送。

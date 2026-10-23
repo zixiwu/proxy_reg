@@ -395,9 +395,17 @@ def reload_main_module_config(main_mod) -> list:
     Re-read env into main.py module globals used at runtime.
     Returns list of reloaded attribute names.
     """
+    import os
+
     from dotenv import load_dotenv
 
+    # .env 中的空值不应覆盖进程里已有的非空环境变量：
+    # 容器通过 compose 注入 TURNSTILE_SOLVER_URL 等配置时，配置文件里留空表示沿用外部配置。
+    before = dict(os.environ)
     load_dotenv(override=True)
+    for key, old_value in before.items():
+        if old_value and not os.environ.get(key):
+            os.environ[key] = old_value
     reloaded = []
 
     def setg(name, value):

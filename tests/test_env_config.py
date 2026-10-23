@@ -8,6 +8,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.env_config import (
+    reload_main_module_config,
     parse_env_file,
     upsert_env_file,
     get_config_for_ui,
@@ -110,3 +111,28 @@ class TestConfigPageSource(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReloadKeepsExternalEnv(unittest.TestCase):
+    """reload_main_module_config 不应让 .env 里的空值覆盖容器注入的环境变量。"""
+
+    def test_empty_dotenv_value_does_not_clobber_env(self):
+        import types
+
+        with tempfile.TemporaryDirectory() as td:
+            env_path = os.path.join(td, ".env")
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.write("RESIN_NAME=\nREGISTER_INTERVAL=7\n")
+
+            with patch("dotenv.main.find_dotenv", return_value=env_path):
+                with patch.dict(
+                    os.environ,
+                    {"RESIN_NAME": "from-container", "REGISTER_INTERVAL": "1"},
+                    clear=False,
+                ):
+                    mod = types.SimpleNamespace()
+                    reload_main_module_config(mod)
+                    # 空值沿用外部配置
+                    self.assertEqual(mod.RESIN_NAME, "from-container")
+                    # 非空值仍然覆盖，保证配置页修改可生效
+                    self.assertEqual(mod.REGISTER_INTERVAL, 7.0)

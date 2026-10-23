@@ -1,25 +1,64 @@
+# 开箱即用：镜像内置 Turnstile Solver 与 camoufox 浏览器，
+# 宿主机只需 Docker，无需另装 Python / 浏览器 / solver。
+#
 # 用法：
-#   cp .env.example .env   # 先准备配置文件（必须存在）
-#   docker compose up --build
+#   cp .env.example .env
+#   docker compose up -d --build
+#   # 打开 http://127.0.0.1:5080
+
+x-app: &app
+  build:
+    context: .
+  # 默认本地构建；也可直接拉 CI 镜像：
+  #   IMAGE=ghcr.io/zixiwu/proxy_reg:latest docker compose up -d
+  image: ${IMAGE:-proxyscrape-register:latest}
+  restart: unless-stopped
+  extra_hosts:
+    # 便于把 solver 换成宿主机/外部服务时使用 host.docker.internal
+    - "host.docker.internal:host-gateway"
+
 services:
+  # Web 管理台 + 批量注册
   proxyscrape:
-    build: .
-    image: proxyscrape-register:latest
+    <<: *app
     env_file:
       - .env
     environment:
       # 容器内必须监听 0.0.0.0 才能被宿主机访问
       WEB_HOST: "0.0.0.0"
       WEB_PORT: "${WEB_PORT:-5080}"
-      # Turnstile Solver 通常跑在宿主机（需要浏览器），容器经 host.docker.internal 访问
-      TURNSTILE_SOLVER_URL: "${TURNSTILE_SOLVER_URL:-http://host.docker.internal:5072}"
+      # 默认走 compose 内置的 solver 服务；如需外部 solver 用 .env 覆盖
+      TURNSTILE_SOLVER_URL: "${TURNSTILE_SOLVER_URL:-http://solver:5072}"
     ports:
       - "${WEB_PORT:-5080}:${WEB_PORT:-5080}"
     volumes:
       # 产物持久化 + 配置页写回 .env 后宿主机可见
       - ./keys:/app/keys
       - ./.env:/app/.env
-    extra_hosts:
-      # 让容器内能用 host.docker.internal 指向宿主机（Linux 需要 host-gateway）
-      - "host.docker.internal:host-gateway"
+    depends_on:
+      solver:
+        condition: service_started
+
+  # Turnstile 求解服务：复用同一镜像，不再重复构建
+  solver:
+    image: ${IMAGE:-proxyscrape-register:latest}
     restart: unless-stopped
+    command:
+      - python
+      - api_solver.py
+      - --browser_type
+      - camoufox
+      - --thread
+      - "1"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5072"
+    # 浏览器需要较大的 /dev/shm，避免求解时崩溃
+    shm_size: "1gb"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket;socket.create_connection(('127.0.0.1',5072),3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
